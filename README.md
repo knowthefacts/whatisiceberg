@@ -9,7 +9,7 @@ This project provides a unified solution for migrating AWS Athena tables to Apac
 ```
 awsiceberg2/
 ├── README.md                           # This comprehensive guide
-├── unified_migration.py                # Single migration script with integrated validation framework
+├── aws_iceberg_migration.py            # Single migration script with integrated validation framework
 ├── pre_migration_analysis.sql          # Pre-migration analysis queries
 └── post_migration_verification.sql     # Post-migration verification queries
 ```
@@ -112,7 +112,7 @@ TARGET_S3_LOCATION = "s3://your-bucket/iceberg/"  # New Iceberg table location
 ### In-Place Migration
 
 ```bash
-aws glue start-job-run --job-name iceberg-unified-migration --arguments '{
+aws glue start-job-run --job-name aws-iceberg-migration --arguments '{
     "--MIGRATION_TYPE": "inplace",
     "--SOURCE_DATABASE": "production_db",
     "--SOURCE_TABLE": "sales_data",
@@ -125,7 +125,7 @@ aws glue start-job-run --job-name iceberg-unified-migration --arguments '{
 ### New Table Migration
 
 ```bash
-aws glue start-job-run --job-name iceberg-unified-migration --arguments '{
+aws glue start-job-run --job-name aws-iceberg-migration --arguments '{
     "--MIGRATION_TYPE": "newtable",
     "--SOURCE_DATABASE": "production_db",
     "--SOURCE_TABLE": "sales_data",
@@ -452,11 +452,11 @@ spark.conf.set("spark.sql.catalog.glue_catalog.type", "glue")
 
 ```json
 {
-    "JobName": "iceberg-unified-migration",
+    "JobName": "aws-iceberg-migration",
     "Role": "arn:aws:iam::ACCOUNT:role/GlueServiceRole",
     "Command": {
         "Name": "glueetl",
-        "ScriptLocation": "s3://your-bucket/scripts/unified_migration.py",
+        "ScriptLocation": "s3://your-bucket/scripts/aws_iceberg_migration.py",
         "PythonVersion": "3"
     },
     "DefaultArguments": {
@@ -569,7 +569,7 @@ The script provides comprehensive statistics:
 
 2. **Monitor Job Progress**
    ```bash
-   aws glue get-job-run --job-name iceberg-unified-migration --run-id RUN_ID
+   aws glue get-job-run --job-name aws-iceberg-migration --run-id RUN_ID
    ```
 
 3. **Validate Data**
@@ -583,7 +583,7 @@ The script provides comprehensive statistics:
 1. **Immediate Rollback** (if migration fails during process):
    ```bash
    # Stop the Glue job
-   aws glue stop-job-run --job-name iceberg-unified-migration --job-run-id JOB_RUN_ID
+   aws glue stop-job-run --job-name aws-iceberg-migration --job-run-id JOB_RUN_ID
    
    # Restore from backup if available
    aws s3 sync s3://backup-bucket/table-backup/ s3://original-location/

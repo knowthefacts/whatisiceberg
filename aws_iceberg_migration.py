@@ -1,5 +1,5 @@
 """
-AWS Glue 5.0 - Unified Iceberg Migration Script with Integrated Validation
+AWS Glue 5.0 - AWS Iceberg Migration Script with Integrated Validation
 
 This script provides both in-place and new table migration options for converting
 AWS Athena tables to Apache Iceberg format using AWS Glue 5.0 native Iceberg support.
@@ -7,7 +7,7 @@ Includes comprehensive validation framework integrated into the migration proces
 
 Usage:
     # For In-Place Migration (replaces original table in same location)
-    aws glue start-job-run --job-name iceberg-unified-migration --arguments '{
+    aws glue start-job-run --job-name aws-iceberg-migration --arguments '{
         "--MIGRATION_TYPE": "inplace",
         "--SOURCE_DATABASE": "your_database",
         "--SOURCE_TABLE": "your_table",
@@ -17,7 +17,7 @@ Usage:
     }'
     
     # For New Table Migration (creates new table in different location)
-    aws glue start-job-run --job-name iceberg-unified-migration --arguments '{
+    aws glue start-job-run --job-name aws-iceberg-migration --arguments '{
         "--MIGRATION_TYPE": "newtable",
         "--SOURCE_DATABASE": "your_database",
         "--SOURCE_TABLE": "your_table",
@@ -44,7 +44,7 @@ import json
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class UnifiedIcebergMigration:
+class AWSIcebergMigration:
     def __init__(self, spark, glue_context, glue_client):
         self.spark = spark
         self.glue_context = glue_context
@@ -718,7 +718,7 @@ def main():
     
     try:
         # Initialize migration framework
-        migration = UnifiedIcebergMigration(
+        migration = AWSIcebergMigration(
             spark=spark,
             glue_context=glueContext,
             glue_client=glue_client
@@ -735,7 +735,7 @@ def main():
             temp_s3_location=args.get('TEMP_S3_LOCATION')
         )
         
-        logger.info("Unified Iceberg migration completed successfully!")
+        logger.info("AWS Iceberg migration completed successfully!")
         
     except Exception as e:
         logger.error(f"Migration failed: {str(e)}")
