@@ -34,7 +34,7 @@ from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
+from pyspark.sql.functions import col, count, sum, avg, min, max, stddev
 import boto3
 import logging
 from datetime import datetime
@@ -52,7 +52,7 @@ class AWSIcebergMigration:
         self.migration_stats = {}
         self.validation_results = {}
     
-    def configure_iceberg_support(self):
+    def configure_iceberg_support(self, warehouse_location=None):
         """Configure Spark session for native Iceberg support in Glue 5.0"""
         try:
             logger.info("Configuring native Iceberg support for Glue 5.0...")
@@ -61,7 +61,11 @@ class AWSIcebergMigration:
             self.spark.conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
             self.spark.conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
             self.spark.conf.set("spark.sql.catalog.glue_catalog.type", "glue")
-            self.spark.conf.set("spark.sql.catalog.glue_catalog.warehouse", "s3://your-warehouse-bucket/")
+            
+            # Only set warehouse location if provided (optional for Glue catalog)
+            if warehouse_location:
+                self.spark.conf.set("spark.sql.catalog.glue_catalog.warehouse", warehouse_location)
+                logger.info(f"Warehouse location set to: {warehouse_location}")
             
             # Configure Iceberg table properties
             self.spark.conf.set("spark.sql.iceberg.vectorization.enabled", "true")
@@ -83,16 +87,24 @@ class AWSIcebergMigration:
             
             # Extract table properties from Athena/Glue metadata
             table_properties = table_info.get('Parameters', {})
-            storage_descriptor = table_info['StorageDescriptor']
+            storage_descriptor = table_info.get('StorageDescriptor')
+            
+            if not storage_descriptor:
+                raise ValueError(f"Table {database}.{table} has no storage descriptor. Cannot migrate.")
+            
+            # Safely extract storage descriptor fields
+            location = storage_descriptor.get('Location')
+            if not location:
+                raise ValueError(f"Table {database}.{table} has no S3 location defined. Cannot migrate.")
             
             metadata = {
-                'name': table_info['Name'],
+                'name': table_info.get('Name', table),
                 'database': database,
-                'location': storage_descriptor['Location'],
-                'input_format': storage_descriptor['InputFormat'],
-                'output_format': storage_descriptor['OutputFormat'],
-                'serde_info': storage_descriptor['SerdeInfo'],
-                'columns': storage_descriptor['Columns'],
+                'location': location,
+                'input_format': storage_descriptor.get('InputFormat', 'Unknown'),
+                'output_format': storage_descriptor.get('OutputFormat', 'Unknown'),
+                'serde_info': storage_descriptor.get('SerdeInfo', {}),
+                'columns': storage_descriptor.get('Columns', []),
                 'partition_keys': [col['Name'] for col in table_info.get('PartitionKeys', [])],
                 'table_type': table_info.get('TableType', 'EXTERNAL_TABLE'),
                 'parameters': table_properties,
@@ -103,12 +115,21 @@ class AWSIcebergMigration:
                 'distribution_mode': table_properties.get('distribution_mode', 'hash')
             }
             
+            # Validate that table has columns
+            if not metadata['columns']:
+                logger.warning(f"Table {database}.{table} has no columns defined in metadata")
+            
             logger.info(f"Table metadata retrieved: {len(metadata['columns'])} columns, {len(metadata['partition_keys'])} partitions")
             logger.info(f"Table properties: compression={metadata['compression']}, format={metadata['file_format']}")
+            logger.info(f"Table location: {metadata['location']}")
+            
             return metadata
             
+        except self.glue_client.exceptions.EntityNotFoundException:
+            logger.error(f"Table {database}.{table} not found in Glue catalog")
+            raise ValueError(f"Table {database}.{table} does not exist in Glue catalog")
         except Exception as e:
-            logger.error(f"Failed to get table metadata: {str(e)}")
+            logger.error(f"Failed to get table metadata for {database}.{table}: {str(e)}")
             raise e
     
     def create_iceberg_table(self, database, table, s3_location, schema, partition_keys=None, table_properties=None):
@@ -485,12 +506,13 @@ class AWSIcebergMigration:
             logger.info("Starting in-place migration with validation...")
             
             # Step 1: Create temporary Iceberg table
-            temp_table = f"{target_database}.{target_table}_temp"
-            logger.info(f"Creating temporary table: {temp_table}")
+            temp_table_name = f"{target_table}_temp"
+            temp_table_full = f"{target_database}.{temp_table_name}"
+            logger.info(f"Creating temporary table: {temp_table_full}")
             
             self.create_iceberg_table(
                 database=target_database,
-                table=f"{target_table}_temp",
+                table=temp_table_name,
                 s3_location=temp_s3_location,
                 schema=source_metadata['columns'],
                 partition_keys=source_metadata['partition_keys'],
@@ -513,21 +535,21 @@ class AWSIcebergMigration:
             if source_metadata['partition_keys']:
                 writer = writer.partitionBy(*source_metadata['partition_keys'])
             
-            writer.saveAsTable(temp_table)
+            writer.saveAsTable(temp_table_full)
             
             # Step 3: CRITICAL - Validate temporary table against source
             logger.info("Validating temporary table against source...")
             validation_passed = self.comprehensive_validation(
                 source_metadata, 
                 target_database, 
-                f"{target_table}_temp", 
+                temp_table_name, 
                 "inplace"
             )
             
             if not validation_passed:
                 logger.error("Validation failed for temporary table. Aborting in-place migration.")
                 # Clean up temporary table
-                self.spark.sql(f"DROP TABLE IF EXISTS {temp_table}")
+                self.spark.sql(f"DROP TABLE IF EXISTS {temp_table_full}")
                 raise Exception("Validation failed for temporary table. Migration aborted.")
             
             logger.info("Validation passed for temporary table. Proceeding with replacement...")
@@ -535,28 +557,70 @@ class AWSIcebergMigration:
             # Step 4: Replace original table with validated temporary table
             logger.info("Replacing original table with validated Iceberg table...")
             
-            # Drop original table
+            # Drop original table (this removes the table definition, not the data)
             self.spark.sql(f"DROP TABLE IF EXISTS {target_database}.{target_table}")
             
-            # Create final Iceberg table in the same location as original (in-place)
-            self.create_iceberg_table(
-                database=target_database,
-                table=target_table,
-                s3_location=source_metadata['location'],  # Use original table's S3 location
-                schema=source_metadata['columns'],
-                partition_keys=source_metadata['partition_keys'],
-                table_properties=source_metadata
-            )
-            
-            # Copy data from temporary table to final table
-            temp_df = self.spark.table(temp_table)
-            temp_df.write \
-                .format("iceberg") \
-                .mode("append") \
-                .saveAsTable(f"{target_database}.{target_table}")
-            
-            # Clean up temporary table
-            self.spark.sql(f"DROP TABLE IF EXISTS {temp_table}")
+            # Rename temporary table to target table name (this just updates metadata)
+            # Note: Iceberg doesn't support ALTER TABLE RENAME in Spark SQL, so we use Glue API
+            try:
+                # Update the table name in Glue catalog
+                temp_table_metadata = self.glue_client.get_table(
+                    DatabaseName=target_database,
+                    Name=temp_table_name
+                )
+                
+                table_input = temp_table_metadata['Table']
+                # Remove read-only fields
+                table_input.pop('DatabaseName', None)
+                table_input.pop('CreateTime', None)
+                table_input.pop('UpdateTime', None)
+                table_input.pop('CreatedBy', None)
+                table_input.pop('IsRegisteredWithLakeFormation', None)
+                table_input.pop('CatalogId', None)
+                table_input.pop('VersionId', None)
+                
+                # Update table name and location to original
+                table_input['Name'] = target_table
+                table_input['StorageDescriptor']['Location'] = source_metadata['location']
+                
+                # Create new table with original name and location
+                self.glue_client.create_table(
+                    DatabaseName=target_database,
+                    TableInput=table_input
+                )
+                
+                # Delete temporary table
+                self.spark.sql(f"DROP TABLE IF EXISTS {temp_table_full}")
+                
+                logger.info(f"Successfully replaced {target_database}.{target_table} with validated Iceberg table")
+                
+            except Exception as rename_error:
+                logger.warning(f"Could not rename table via Glue API: {str(rename_error)}")
+                logger.info("Falling back to creating new table and copying data...")
+                
+                # Fallback: Create final Iceberg table in the original location
+                self.create_iceberg_table(
+                    database=target_database,
+                    table=target_table,
+                    s3_location=source_metadata['location'],
+                    schema=source_metadata['columns'],
+                    partition_keys=source_metadata['partition_keys'],
+                    table_properties=source_metadata
+                )
+                
+                # Copy data from temporary table to final table
+                temp_df = self.spark.table(temp_table_full)
+                writer = temp_df.write \
+                    .format("iceberg") \
+                    .mode("append")
+                
+                if source_metadata['partition_keys']:
+                    writer = writer.partitionBy(*source_metadata['partition_keys'])
+                
+                writer.saveAsTable(f"{target_database}.{target_table}")
+                
+                # Clean up temporary table
+                self.spark.sql(f"DROP TABLE IF EXISTS {temp_table_full}")
             
             logger.info("In-place migration completed successfully with validation")
             
@@ -564,7 +628,8 @@ class AWSIcebergMigration:
             logger.error(f"In-place migration failed: {str(e)}")
             # Clean up temporary table if it exists
             try:
-                self.spark.sql(f"DROP TABLE IF EXISTS {target_database}.{target_table}_temp")
+                temp_table_full = f"{target_database}.{target_table}_temp"
+                self.spark.sql(f"DROP TABLE IF EXISTS {temp_table_full}")
             except:
                 pass
             raise e
@@ -636,7 +701,7 @@ class AWSIcebergMigration:
             logger.warning(f"Table optimization failed: {str(e)}")
     
     def execute_migration(self, migration_type, source_database, source_table, 
-                         target_database, target_table, target_s3_location=None, temp_s3_location=None):
+                         target_database, target_table, target_s3_location=None, temp_s3_location=None, warehouse_location=None):
         """Execute the migration based on the specified type with integrated validation"""
         try:
             logger.info(f"Starting {migration_type} migration with integrated validation...")
@@ -647,7 +712,7 @@ class AWSIcebergMigration:
             source_metadata = self.get_table_metadata(source_database, source_table)
             
             # Configure Iceberg support
-            self.configure_iceberg_support()
+            self.configure_iceberg_support(warehouse_location)
             
             if migration_type.lower() == "inplace":
                 # In-place migration with validation before replacement
@@ -694,17 +759,30 @@ class AWSIcebergMigration:
 
 def main():
     """Main migration function"""
-    # Get job parameters
-    args = getResolvedOptions(sys.argv, [
+    # Get required job parameters
+    required_args = [
         'JOB_NAME',
         'MIGRATION_TYPE',
         'SOURCE_DATABASE',
         'SOURCE_TABLE',
         'TARGET_DATABASE',
-        'TARGET_TABLE',
-        'TARGET_S3_LOCATION',
-        'TEMP_S3_LOCATION'
-    ])
+        'TARGET_TABLE'
+    ]
+    
+    # Get required parameters
+    args = getResolvedOptions(sys.argv, required_args)
+    
+    # Get optional parameters manually from sys.argv
+    optional_params = {
+        'TARGET_S3_LOCATION': None,
+        'TEMP_S3_LOCATION': None,
+        'WAREHOUSE_LOCATION': None
+    }
+    
+    for arg in sys.argv:
+        for param_name in optional_params.keys():
+            if arg.startswith(f'--{param_name}='):
+                optional_params[param_name] = arg.split('=', 1)[1]
     
     # Initialize Spark and Glue contexts
     sc = SparkContext()
@@ -731,8 +809,9 @@ def main():
             source_table=args['SOURCE_TABLE'],
             target_database=args['TARGET_DATABASE'],
             target_table=args['TARGET_TABLE'],
-            target_s3_location=args['TARGET_S3_LOCATION'],
-            temp_s3_location=args.get('TEMP_S3_LOCATION')
+            target_s3_location=optional_params['TARGET_S3_LOCATION'],
+            temp_s3_location=optional_params['TEMP_S3_LOCATION'],
+            warehouse_location=optional_params['WAREHOUSE_LOCATION']
         )
         
         logger.info("AWS Iceberg migration completed successfully!")

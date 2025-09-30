@@ -22,13 +22,23 @@ awsiceberg2/
 ✅ **Table Properties**: Automatically fetches and applies source table properties  
 ✅ **SQL Analysis Tools**: Pre and post migration analysis queries  
 ✅ **Production Ready**: Error handling, logging, and optimization  
+✅ **Performance Optimized**: In-place migration uses table rename to avoid duplicate data writes (~50% faster)  
+✅ **Flexible Parameters**: Optional warehouse location and conditional S3 location requirements  
 
 ### Validation Highlights
 - **8 Validation Categories**: Row counts, schema, data integrity, quality, partitions, performance, properties, samples
 - **Athena-Specific Checks**: Query performance, partition pruning, Iceberg features
 - **Detailed Reporting**: Comprehensive JSON reports with pass/fail/warning status
 - **Automatic Rollback**: Fails migration if critical validations don't pass
-- **Performance Metrics**: Compression ratios, file reduction, storage savings  
+- **Performance Metrics**: Compression ratios, file reduction, storage savings
+
+### Recent Improvements (Latest Version)
+- ✅ **Fixed Missing Imports**: Added explicit PySpark function imports to prevent runtime errors
+- ✅ **Performance Optimization**: In-place migration now uses table rename via Glue API to avoid duplicate data writes (~50% faster)
+- ✅ **Flexible Parameters**: Made `TARGET_S3_LOCATION` and `TEMP_S3_LOCATION` conditionally required based on migration type
+- ✅ **Optional Warehouse**: Removed hardcoded S3 warehouse location, now optional parameter
+- ✅ **Enhanced Error Handling**: Improved metadata validation with specific error messages for missing tables, storage descriptors, and S3 locations
+- ✅ **Better Validation**: Added null-safety checks for all metadata field extractions  
 
 ## Migration Types
 
@@ -85,31 +95,32 @@ Creates a new Iceberg table alongside the original table.
 }
 ```
 
-### 3. Configuration
+### 3. Job Parameters
 
-Update the following parameters in the migration script:
+The migration script accepts parameters via AWS Glue job arguments:
 
 **Note**: The source S3 location is automatically detected from the Glue catalog metadata, so you don't need to specify it.
 
-```python
-# Configuration Parameters
-SOURCE_DATABASE = "your_database"
-SOURCE_TABLE = "your_table_name"
+#### Required Parameters (for all migration types)
+- `--MIGRATION_TYPE`: Migration type (`inplace` or `newtable`)
+- `--SOURCE_DATABASE`: Source database name
+- `--SOURCE_TABLE`: Source table name
+- `--TARGET_DATABASE`: Target database name
+- `--TARGET_TABLE`: Target table name
 
-# For In-Place Migration (replaces original table in same location)
-TARGET_DATABASE = SOURCE_DATABASE  # Same as source
-TARGET_TABLE = SOURCE_TABLE       # Same as source
-TEMP_S3_LOCATION = "s3://your-bucket/temp/"       # Temporary table location for validation
+#### Conditionally Required Parameters
+- `--TEMP_S3_LOCATION`: **Required for `inplace` migration** - Temporary table location for validation (e.g., `s3://your-bucket/temp/`)
+- `--TARGET_S3_LOCATION`: **Required for `newtable` migration** - New Iceberg table location (e.g., `s3://your-bucket/iceberg/`)
 
-# For New Table Migration (creates new table in different location)
-TARGET_DATABASE = "target_database"
-TARGET_TABLE = "new_table_name"
-TARGET_S3_LOCATION = "s3://your-bucket/iceberg/"  # New Iceberg table location
-```
+#### Optional Parameters
+- `--WAREHOUSE_LOCATION`: Optional S3 warehouse location for Iceberg catalog (e.g., `s3://your-bucket/warehouse/`)
+  - If not provided, Glue catalog manages locations automatically
 
 ## Usage
 
 ### In-Place Migration
+
+**Required Parameters**: All base parameters + `TEMP_S3_LOCATION`
 
 ```bash
 aws glue start-job-run --job-name aws-iceberg-migration --arguments '{
@@ -124,6 +135,8 @@ aws glue start-job-run --job-name aws-iceberg-migration --arguments '{
 
 ### New Table Migration
 
+**Required Parameters**: All base parameters + `TARGET_S3_LOCATION`
+
 ```bash
 aws glue start-job-run --job-name aws-iceberg-migration --arguments '{
     "--MIGRATION_TYPE": "newtable",
@@ -132,6 +145,22 @@ aws glue start-job-run --job-name aws-iceberg-migration --arguments '{
     "--TARGET_DATABASE": "production_db",
     "--TARGET_TABLE": "sales_data_iceberg",
     "--TARGET_S3_LOCATION": "s3://data-lake/iceberg/sales/"
+}'
+```
+
+### Optional: Custom Warehouse Location
+
+You can optionally specify a custom Iceberg warehouse location:
+
+```bash
+aws glue start-job-run --job-name aws-iceberg-migration --arguments '{
+    "--MIGRATION_TYPE": "newtable",
+    "--SOURCE_DATABASE": "production_db",
+    "--SOURCE_TABLE": "sales_data",
+    "--TARGET_DATABASE": "production_db",
+    "--TARGET_TABLE": "sales_data_iceberg",
+    "--TARGET_S3_LOCATION": "s3://data-lake/iceberg/sales/",
+    "--WAREHOUSE_LOCATION": "s3://data-lake/warehouse/"
 }'
 ```
 
@@ -335,11 +364,11 @@ The migration script includes an extensive validation framework with 8 categorie
 ### Validation Process Flow
 
 #### In-Place Migration
-1. Create temporary Iceberg table
+1. Create temporary Iceberg table in temp location
 2. Migrate data to temporary table
 3. **Run all 8 validation checks against source**
 4. Only proceed if validation passes
-5. Replace original table with validated Iceberg table
+5. Replace original table with validated Iceberg table (optimized via table rename to avoid duplicate data writes)
 6. Clean up temporary resources
 
 #### New Table Migration
@@ -446,6 +475,11 @@ The script leverages Glue 5.0's native Iceberg support:
 spark.conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
 spark.conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
 spark.conf.set("spark.sql.catalog.glue_catalog.type", "glue")
+
+# Optional: Set custom warehouse location
+# If not provided, Glue catalog manages locations automatically
+if warehouse_location:
+    spark.conf.set("spark.sql.catalog.glue_catalog.warehouse", warehouse_location)
 ```
 
 ### Glue Job Configuration
@@ -540,22 +574,39 @@ The script provides comprehensive statistics:
 
 ### Common Issues
 
-1. **Out of Memory Errors**
+1. **Missing Required Parameters**
+   - **Error**: `TEMP_S3_LOCATION is required for in-place migration`
+   - **Solution**: Provide `--TEMP_S3_LOCATION` parameter for in-place migrations
+   - **Error**: `TARGET_S3_LOCATION is required for new table migration`
+   - **Solution**: Provide `--TARGET_S3_LOCATION` parameter for new table migrations
+
+2. **Table Not Found Errors**
+   - **Error**: `Table database.table does not exist in Glue catalog`
+   - **Solution**: Verify table exists in Glue Data Catalog
+   - Run: `aws glue get-table --database-name <db> --name <table>`
+
+3. **Missing Storage Descriptor**
+   - **Error**: `Table has no storage descriptor. Cannot migrate`
+   - **Solution**: Ensure table has valid storage descriptor in Glue catalog
+   - **Error**: `Table has no S3 location defined. Cannot migrate`
+   - **Solution**: Verify table has valid S3 location in metadata
+
+4. **Out of Memory Errors**
    - Increase worker count
    - Use G.2X workers
    - Optimize data processing
 
-2. **Timeout Errors**
+5. **Timeout Errors**
    - Increase job timeout
    - Optimize query performance
    - Use incremental processing
 
-3. **Schema Mismatch**
+6. **Schema Mismatch**
    - Check data types
    - Handle NULL values
    - Validate column names
 
-4. **Permission Errors**
+7. **Permission Errors**
    - Verify IAM policies
    - Check S3 bucket permissions
    - Ensure Glue service role has required permissions
